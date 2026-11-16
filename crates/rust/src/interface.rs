@@ -2918,15 +2918,22 @@ impl {camel} {{
     #[doc(hidden)]
     fn type_guard<T: {rt}::Resource>() {{
         use core::any::TypeId;
+        use core::sync::atomic::{{AtomicBool, Ordering}};
         static mut LAST_TYPE: Option<TypeId> = None;
-        unsafe {{
-            assert!(!cfg!(target_feature = "atomics"));
-            let id = TypeId::of::<T>();
-            match LAST_TYPE {{
-                Some(ty) => assert!(ty == id, "cannot use two types with this resource type"),
-                None => LAST_TYPE = Some(id),
-            }}
+        // Held while `LAST_TYPE` is read or written, so that threads
+        // sharing this component's memory agree on the first type.
+        static LOCK: AtomicBool = AtomicBool::new(false);
+        while LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {{
+            core::hint::spin_loop();
         }}
+        let id = TypeId::of::<T>();
+        // SAFETY: `LOCK` is held, so nothing else accesses `LAST_TYPE`.
+        let first = unsafe {{ *(*core::ptr::addr_of_mut!(LAST_TYPE)).get_or_insert(id) }};
+        LOCK.store(false, Ordering::Release);
+        assert!(first == id, "cannot use two types with this resource type");
     }}
 
     #[doc(hidden)]
