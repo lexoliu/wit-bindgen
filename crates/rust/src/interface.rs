@@ -2932,15 +2932,55 @@ impl {camel} {{
     #[doc(hidden)]
     fn type_guard<T: {rt}::Resource>() {{
         use core::any::TypeId;
-        static mut LAST_TYPE: Option<TypeId> = None;
-        unsafe {{
-            assert!(!cfg!(target_feature = "atomics"));
-            let id = TypeId::of::<T>();
-            match LAST_TYPE {{
-                Some(ty) => assert!(ty == id, "cannot use two types with this resource type"),
-                None => LAST_TYPE = Some(id),
+        use core::cell::UnsafeCell;
+        use core::mem::MaybeUninit;
+
+        struct TypeCell(UnsafeCell<MaybeUninit<TypeId>>);
+        // SAFETY: concurrent access is synchronized by `STATE` when atomic CAS
+        // is available, or confined to a single execution context otherwise.
+        unsafe impl Sync for TypeCell {{}}
+
+        static FIRST_TYPE: TypeCell = TypeCell(UnsafeCell::new(MaybeUninit::uninit()));
+        let id = TypeId::of::<T>();
+
+        #[cfg(target_has_atomic = "8")]
+        let expected = {{
+            use core::sync::atomic::{{AtomicU8, Ordering}};
+            const UNINIT: u8 = 0;
+            const RUNNING: u8 = 1;
+            const READY: u8 = 2;
+            static STATE: AtomicU8 = AtomicU8::new(UNINIT);
+
+            if STATE.load(Ordering::Acquire) != READY {{
+                if STATE
+                    .compare_exchange(UNINIT, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {{
+                    unsafe {{
+                        (*FIRST_TYPE.0.get()).write(id);
+                    }}
+                    STATE.store(READY, Ordering::Release);
+                }} else {{
+                    while STATE.load(Ordering::Acquire) != READY {{
+                        core::hint::spin_loop();
+                    }}
+                }}
             }}
-        }}
+            unsafe {{ (*FIRST_TYPE.0.get()).assume_init_read() }}
+        }};
+
+        #[cfg(not(target_has_atomic = "8"))]
+        let expected = unsafe {{
+            static mut INITIALIZED: bool = false;
+            assert!(!cfg!(target_feature = "atomics"));
+            if !core::ptr::read(&raw const INITIALIZED) {{
+                (*FIRST_TYPE.0.get()).write(id);
+                core::ptr::write(&raw mut INITIALIZED, true);
+            }}
+            (*FIRST_TYPE.0.get()).assume_init_read()
+        }};
+
+        assert!(expected == id, "cannot use two types with this resource type");
     }}
 
     #[doc(hidden)]
